@@ -1,6 +1,6 @@
 ﻿import { Link, NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
-import { Sparkles, LogOut, User } from "lucide-react";
+import { Sparkles, LogOut, User, Briefcase } from "lucide-react";
 
 export default function Navbar() {
   const { user, logout } = useAuth();
@@ -19,26 +19,58 @@ export default function Navbar() {
             <div className="absolute inset-0 rounded-xl bg-gradient-to-br from-neon-indigo to-neon-purple blur-md opacity-60 group-hover:opacity-100 transition" />
             <div className="relative h-9 w-9 rounded-xl bg-gradient-to-br from-neon-indigo via-neon-purple to-neon-cyan p-[1.5px]">
               <div className="h-full w-full rounded-[10px] bg-void-800 flex items-center justify-center">
-                <Sparkles size={16} className="text-neon-cyan" />
+                <Briefcase size={16} className="text-neon-cyan" />
               </div>
             </div>
           </div>
           <span className="font-bold text-lg tracking-tight shimmer-text">
-            GCS <span className="text-white/90">AI</span>
+            Attachment<span className="text-white/90">Hub</span>
           </span>
         </Link>
 
         <nav className="flex items-center gap-1 text-sm font-medium">
           {user?.role === "candidate" && (
-            <NavLink to="/candidate" className="px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-white/5 transition">
-              My Matches
-            </NavLink>
+            <>
+              <NavLink
+                to="/student"
+                className={({ isActive }) =>
+                  `px-3 py-2 rounded-lg transition ${isActive ? "text-white bg-white/5" : "text-slate-300 hover:text-white hover:bg-white/5"}`
+                }
+              >
+                Browse Attachments
+              </NavLink>
+              <NavLink
+                to="/student/applications"
+                className={({ isActive }) =>
+                  `px-3 py-2 rounded-lg transition ${isActive ? "text-white bg-white/5" : "text-slate-300 hover:text-white hover:bg-white/5"}`
+                }
+              >
+                My Applications
+              </NavLink>
+            </>
           )}
+
           {user?.role === "employer" && (
-            <NavLink to="/employer" className="px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-white/5 transition">
-              Find Candidates
-            </NavLink>
+            <>
+              <NavLink
+                to="/company"
+                className={({ isActive }) =>
+                  `px-3 py-2 rounded-lg transition ${isActive ? "text-white bg-white/5" : "text-slate-300 hover:text-white hover:bg-white/5"}`
+                }
+              >
+                My Attachments
+              </NavLink>
+              <NavLink
+                to="/company/post"
+                className={({ isActive }) =>
+                  `px-3 py-2 rounded-lg transition ${isActive ? "text-white bg-white/5" : "text-slate-300 hover:text-white hover:bg-white/5"}`
+                }
+              >
+                Post Attachment
+              </NavLink>
+            </>
           )}
+
           {user?.role === "admin" && (
             <NavLink
               to="/admin"
@@ -63,7 +95,10 @@ export default function Navbar() {
             </div>
           ) : (
             <div className="flex items-center gap-2 ml-3">
-              <Link to="/login" className="px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-white/5 transition">
+              <Link
+                to="/login"
+                className="px-3 py-2 rounded-lg text-slate-300 hover:text-white hover:bg-white/5 transition"
+              >
                 Login
               </Link>
               <Link to="/register" className="btn-primary !py-2 !px-4 !text-sm">

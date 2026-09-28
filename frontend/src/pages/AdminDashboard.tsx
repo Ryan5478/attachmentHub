@@ -55,7 +55,7 @@ function CsvImportCard({ onImported }: { onImported: () => void }) {
     try {
       const form = new FormData();
       form.append("file", file);
-      const { data } = await api.post("/admin/upload-candidates-csv", form);
+      const { data } = await api.post("/admin/upload-students-csv", form);
       setResult(data);
       toast.success(`${data.saved} candidates imported`);
       onImported();
@@ -73,9 +73,9 @@ function CsvImportCard({ onImported }: { onImported: () => void }) {
           <FileSpreadsheet size={16} className="text-neon-cyan" />
         </div>
         <div>
-          <h2 className="font-semibold text-white">Bulk import candidates</h2>
+          <h2 className="font-semibold text-white">Bulk import students</h2>
           <p className="text-xs text-slate-500">
-            CSV with <code className="text-slate-400">full_name</code>,{" "}
+            CSV with <code className="text-slate-400">full_name</code>,{" "}<code className="text-slate-400">email</code>,{" "}
             <code className="text-slate-400">email</code>,{" "}
             <code className="text-slate-400">resume_text</code>
           </p>

@@ -29,3 +29,11 @@ Thumbs.db
 
 # Misc
 *.log
+
+# Backups and local data (never commit)
+_backup_step1/
+backend/data/*.csv
+
+# Backups and local data
+_backup_step1/
+backend/data/*.csv

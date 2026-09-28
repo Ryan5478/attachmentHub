@@ -17,7 +17,7 @@ export default function Login() {
     try {
       const data = await login(email, password);
       toast.success(`Welcome back, ${data.full_name}`);
-      navigate(data.role === "admin" ? "/admin" : data.role === "employer" ? "/employer" : "/candidate");
+      navigate(data.role === "admin" ? "/admin" : data.role === "employer" ? "/company" : "/student");
     } catch (err: any) {
       toast.error(err?.response?.data?.detail ?? "Login failed");
     } finally {

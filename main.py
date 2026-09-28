@@ -1,4 +1,6 @@
 ﻿from __future__ import annotations
+
+from datetime import date
 from backend.engine.job_discovery import discover_jobs
 import json
 from backend.engine.groq_client import chat
@@ -56,7 +58,26 @@ from backend.engine.reranker_service import (
 )
 from backend.engine.user_store import authenticate_user, create_user
 from backend.schemas_auth import RegisterRequest, TokenResponse
-from backend.schemas_db import CandidateCreate, JobRequest
+from backend.schemas_db import (
+    CandidateCreate,
+    JobRequest,
+    CompanyCreate,
+    CompanyRead,
+    CompanyUpdate,
+    StudentCreate,
+    StudentRead,
+    StudentUpdate,
+)
+from backend.models import User, Student, Company, Attachment, Application
+from backend.schemas_attachment import (
+    AttachmentCreate,
+    AttachmentUpdate,
+    AttachmentRead,
+    ApplicationCreate,
+    ApplicationRead,
+    ApplicationStatusUpdate,
+    ApplicantRead,
+)
 
 USE_SIAMESE = False
 FAISS_SHORTLIST_K = 50
@@ -505,15 +526,6 @@ async def match_resume(
     resume: UploadFile = File(...),
     current_user: dict = Depends(require_roles("candidate")),
 ):
-    if not JOBS_DB:
-        raise HTTPException(
-            status_code=500,
-            detail="Job database is empty or failed to load.",
-        )
-
-    if JOB_INDEX is None or not JOB_INDEX.is_ready():
-        raise HTTPException(status_code=500, detail="FAISS job index is not ready.")
-
     file_bytes = await resume.read()
     resume_text = extract_resume_text(resume.filename, file_bytes)
 
@@ -524,30 +536,13 @@ async def match_resume(
         )
 
     skills = extract_skills(resume_text)
-    scores, indices = JOB_INDEX.search(resume_text, top_k=FAISS_SHORTLIST_K)
+    search_query = _build_job_search_query(resume_text, skills)
+    try:
+        discovered = discover_jobs(search_query, max_results=RECOMMENDATION_TOP_K)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
 
-    candidate_jobs = []
-    candidate_scores = []
-
-    for pos, job_idx in enumerate(indices):
-        if 0 <= job_idx < len(JOBS_DB):
-            candidate_jobs.append(JOBS_DB[job_idx])
-            candidate_scores.append(scores[pos])
-
-    ranked_jobs = rank_jobs_from_candidates(
-        resume_text=resume_text,
-        resume_skills=skills,
-        candidate_jobs=candidate_jobs,
-        semantic_scores=candidate_scores,
-        top_k=FAISS_SHORTLIST_K,
-        use_siamese=USE_SIAMESE,
-    )
-
-    reranked_jobs = rerank_jobs_for_resume(
-        resume_text=resume_text,
-        jobs=ranked_jobs,
-        top_k=RECOMMENDATION_TOP_K,
-    )
+    reranked_jobs = _live_jobs_as_recommendations(discovered["results"])
 
     for job in reranked_jobs:
         job["advice"] = build_job_advice(job)
@@ -562,8 +557,9 @@ async def match_resume(
         "filename": resume.filename,
         "resume_text": resume_text,
         "extracted_skills": skills,
-        "total_jobs_considered": len(JOBS_DB),
-        "faiss_shortlist_count": len(candidate_jobs),
+        "search_query": search_query,
+        "total_jobs_considered": discovered["total_searched"],
+        "filtered_out": discovered["filtered_out"],
         "recommendations_count": len(reranked_jobs),
         "advice_summary": build_candidate_job_summary(reranked_jobs),
         "resume_advice": resume_advice,
@@ -724,6 +720,11 @@ reviewer. Analyze the resume and return ONLY a valid JSON object with these exac
 
 Do not include any text outside the JSON. No markdown fences. No preamble."""
 
+JOB_SEARCH_SYSTEM = """You are a job-search strategist. Build one concise web-search query for
+finding current job postings that match the candidate's resume. Include the strongest role
+titles, technical skills, seniority, and location only when clearly present. Return ONLY a JSON
+object with this exact key: query (a string of 5-20 words)."""
+
 COVER_LETTER_SYSTEM = """You are a professional cover-letter writer for technical roles. \
 Given a candidate's resume and a job description, write a concise, compelling cover letter BODY.
 
@@ -781,17 +782,90 @@ def _normalize_ats(data: dict) -> dict:
     data.setdefault("issues", [])
     data.setdefault("improvements", [])
 
-    # Coerce every section value to int (model sometimes returns strings or floats)
+    try:
+        data["overall_score"] = max(
+            0, min(100, int(round(float(data["overall_score"]))))
+        )
+    except (ValueError, TypeError):
+        data["overall_score"] = 0
+
+    for key in ("issues", "improvements"):
+        value = data[key]
+        if isinstance(value, str):
+            data[key] = [value] if value.strip() else []
+        elif isinstance(value, list):
+            data[key] = [str(item) for item in value if str(item).strip()]
+        else:
+            data[key] = []
+
+    # Coerce every section value to an integer in the schema's valid range.
     if isinstance(data.get("sections"), dict):
         cleaned = {}
         for k, v in data["sections"].items():
             try:
-                cleaned[k] = int(round(float(v)))
+                cleaned[k] = max(0, min(100, int(round(float(v)))))
             except (ValueError, TypeError):
                 continue
         data["sections"] = cleaned
+    else:
+        data["sections"] = {}
 
     return data
+
+
+def _parse_model_json(raw: str) -> dict:
+    """Extract the first JSON object even when the model adds a preamble or fence."""
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(raw):
+        if character != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(raw[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    raise json.JSONDecodeError("No JSON object found", raw, 0)
+
+
+def _build_job_search_query(resume_text: str, skills: List[str]) -> str:
+    prompt = f"RESUME:\n{resume_text}\n\nEXTRACTED SKILLS: {', '.join(skills[:20])}"
+    try:
+        raw = chat(
+            JOB_SEARCH_SYSTEM,
+            prompt,
+            model="qwen/qwen3.8-27b",
+            max_tokens=120,
+            response_format={"type": "json_object"},
+        )
+        query = str(_parse_model_json(raw).get("query", "")).strip()
+        if query:
+            return query
+    except Exception:
+        pass
+
+    fallback = " ".join(skills[:8]).strip()
+    return f"{fallback} jobs hiring" if fallback else "technology jobs hiring"
+
+
+def _live_jobs_as_recommendations(results: List[Dict]) -> List[Dict]:
+    recommendations = []
+    for result in results:
+        title = result.get("title", "Untitled")
+        recommendations.append(
+            {
+                "title": title,
+                "job_title": title,
+                "company": result.get("company", ""),
+                "description": result.get("snippet", ""),
+                "url": result.get("url", ""),
+                "source": result.get("source", ""),
+                "score": 0.5,
+                "matching_skills": [],
+                "required_skills": [],
+            }
+        )
+    return recommendations
 
 
 @app.post("/ai/resume-strength", response_model=AtsStrengthResponse)
@@ -800,27 +874,28 @@ def ai_resume_strength(
     current_user: dict = Depends(require_roles("candidate", "employer", "admin")),
 ):
     user_prompt = f"RESUME:\n{payload.resume_text}\n"
-    raw = chat(
-        ATS_STRENGTH_SYSTEM,
-        user_prompt,
-        model="openai/gpt-oss-20b",
-        max_tokens=800,
-    )
-
-    # Strip accidental markdown fences
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
+    try:
+        raw = chat(
+            ATS_STRENGTH_SYSTEM,
+            user_prompt,
+            model="qwen/qwen3.8-27b",
+            max_tokens=800,
+            response_format={"type": "json_object"},
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"ATS service unavailable: {exc}")
 
     try:
-        data = json.loads(raw)
+        data = _parse_model_json(raw)
     except json.JSONDecodeError:
         raise HTTPException(
             status_code=502,
             detail=f"Model returned invalid JSON: {raw[:200]}",
+        )
+
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=502, detail="Model returned a JSON value instead of an object"
         )
 
     data = _normalize_ats(data)
@@ -842,7 +917,7 @@ def ai_cover_letter(
     raw = chat(
         COVER_LETTER_SYSTEM,
         user_prompt,
-        model="openai/gpt-oss-20b",
+        model="qwen/qwen3.8-27b",
         max_tokens=1200,
     )
 
@@ -875,3 +950,725 @@ def jobs_discover(
         total_searched=data["total_searched"],
         filtered_out=data["filtered_out"],
     )
+
+
+# ===========================================================================
+# STEP 2 — Company profile & attachment endpoints
+# ===========================================================================
+
+
+def _get_current_user_email(current_user: dict) -> str:
+    """Extract email from current_user whether the key is 'email' or 'sub'."""
+    return (current_user.get("email") or current_user.get("sub") or "").strip().lower()
+
+
+def _get_user_by_email(db: Session, email: str) -> User:
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
+def _get_current_company(db: Session, current_user: dict) -> Company:
+    user = _get_user_by_email(db, _get_current_user_email(current_user))
+    company = db.query(Company).filter(Company.user_id == user.id).first()
+    if not company:
+        raise HTTPException(
+            status_code=404,
+            detail="Company profile not found. Create one at POST /companies/me first.",
+        )
+    return company
+
+
+def _skills_to_text(skills: List[str] | None) -> str | None:
+    if not skills:
+        return None
+    cleaned = [s.strip() for s in skills if s and s.strip()]
+    return ", ".join(cleaned) if cleaned else None
+
+
+def _text_to_skills(text: str | None) -> List[str]:
+    if not text:
+        return []
+    return [s.strip() for s in text.split(",") if s.strip()]
+
+
+def _attachment_to_dict(att: Attachment) -> dict:
+    return {
+        "id": att.id,
+        "company_id": att.company_id,
+        "company_name": att.company.name if att.company else None,
+        "company_location": att.company.location if att.company else None,
+        "title": att.title,
+        "description": att.description,
+        "location": att.location,
+        "duration_weeks": att.duration_weeks,
+        "start_date": att.start_date,
+        "deadline": att.deadline,
+        "required_course": att.required_course,
+        "required_skills": _text_to_skills(att.required_skills),
+        "stipend": att.stipend,
+        "positions_available": att.positions_available,
+        "credit_offered": att.credit_offered,
+        "status": att.status,
+        "posted_at": att.posted_at,
+        "updated_at": att.updated_at,
+    }
+
+
+@app.post("/companies/me", response_model=CompanyRead)
+def upsert_my_company(
+    payload: CompanyCreate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("employer")),
+):
+    user = _get_user_by_email(db, _get_current_user_email(current_user))
+    company = db.query(Company).filter(Company.user_id == user.id).first()
+
+    data = payload.model_dump(exclude_unset=True)
+
+    if company:
+        for k, v in data.items():
+            setattr(company, k, v)
+    else:
+        company = Company(user_id=user.id, **data)
+        db.add(company)
+
+    db.commit()
+    db.refresh(company)
+    return company
+
+
+@app.get("/companies/me", response_model=CompanyRead)
+def read_my_company(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("employer")),
+):
+    return _get_current_company(db, current_user)
+
+
+@app.post("/attachments", response_model=AttachmentRead)
+def create_attachment(
+    payload: AttachmentCreate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("employer")),
+):
+    company = _get_current_company(db, current_user)
+
+    att = Attachment(
+        company_id=company.id,
+        title=payload.title,
+        description=payload.description,
+        location=payload.location,
+        duration_weeks=payload.duration_weeks,
+        start_date=payload.start_date,
+        deadline=payload.deadline,
+        required_course=payload.required_course,
+        required_skills=_skills_to_text(payload.required_skills),
+        stipend=payload.stipend,
+        positions_available=payload.positions_available,
+        credit_offered=payload.credit_offered,
+        status="open",
+    )
+    db.add(att)
+    db.commit()
+    db.refresh(att)
+    return _attachment_to_dict(att)
+
+
+@app.get("/my-attachments", response_model=List[AttachmentRead])
+def list_my_attachments(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("employer")),
+):
+    company = _get_current_company(db, current_user)
+    rows = (
+        db.query(Attachment)
+        .filter(Attachment.company_id == company.id)
+        .order_by(Attachment.posted_at.desc())
+        .all()
+    )
+    return [_attachment_to_dict(a) for a in rows]
+
+
+@app.get("/attachments", response_model=List[AttachmentRead])
+def list_open_attachments(
+    q: str | None = None,
+    location: str | None = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
+    query = db.query(Attachment).filter(Attachment.status == "open")
+
+    if location:
+        query = query.filter(Attachment.location.ilike(f"%{location}%"))
+
+    if q:
+        like = f"%{q}%"
+        query = query.filter(
+            (Attachment.title.ilike(like)) | (Attachment.description.ilike(like))
+        )
+
+    rows = query.order_by(Attachment.posted_at.desc()).limit(min(limit, 200)).all()
+    return [_attachment_to_dict(a) for a in rows]
+
+
+@app.get("/attachments/{attachment_id}", response_model=AttachmentRead)
+def get_attachment(attachment_id: int, db: Session = Depends(get_db)):
+    att = db.query(Attachment).filter(Attachment.id == attachment_id).first()
+    if not att:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    return _attachment_to_dict(att)
+
+
+@app.put("/attachments/{attachment_id}", response_model=AttachmentRead)
+def update_attachment(
+    attachment_id: int,
+    payload: AttachmentUpdate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("employer")),
+):
+    company = _get_current_company(db, current_user)
+    att = (
+        db.query(Attachment)
+        .filter(Attachment.id == attachment_id, Attachment.company_id == company.id)
+        .first()
+    )
+    if not att:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    data = payload.model_dump(exclude_unset=True)
+
+    if "required_skills" in data:
+        data["required_skills"] = _skills_to_text(data["required_skills"])
+
+    for k, v in data.items():
+        setattr(att, k, v)
+
+    db.commit()
+    db.refresh(att)
+    return _attachment_to_dict(att)
+
+
+@app.delete("/attachments/{attachment_id}")
+def delete_attachment(
+    attachment_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("employer")),
+):
+    company = _get_current_company(db, current_user)
+    att = (
+        db.query(Attachment)
+        .filter(Attachment.id == attachment_id, Attachment.company_id == company.id)
+        .first()
+    )
+    if not att:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    db.delete(att)
+    db.commit()
+    return {"message": "Attachment deleted", "id": attachment_id}
+
+
+# ===========================================================================
+# STEP 3 — Student profile & application endpoints
+# ===========================================================================
+
+
+def _get_current_student(db: Session, current_user: dict) -> Student:
+    email = _get_current_user_email(current_user)
+    student = db.query(Student).filter(Student.email == email).first()
+    if not student:
+        raise HTTPException(
+            status_code=404,
+            detail="Student profile not found. Create one at POST /students/me first.",
+        )
+    return student
+
+
+def _student_to_dict(s: Student) -> dict:
+    return {
+        "id": s.id,
+        "user_id": s.user_id,
+        "full_name": s.full_name,
+        "email": s.email,
+        "phone": s.phone,
+        "university": s.university,
+        "course": s.course,
+        "year_of_study": s.year_of_study,
+        "expected_graduation": s.expected_graduation,
+        "gpa": s.gpa,
+        "preferred_duration_weeks": s.preferred_duration_weeks,
+        "preferred_location": s.preferred_location,
+        "summary": s.summary,
+        "skills": _text_to_skills(s.skills_text),
+        "original_filename": s.original_filename,
+        "resume_text": s.resume_text,
+        "created_at": s.created_at,
+    }
+
+
+def _application_to_dict(a: Application, include_attachment: bool = True) -> dict:
+    d = {
+        "id": a.id,
+        "student_id": a.student_id,
+        "attachment_id": a.attachment_id,
+        "status": a.status,
+        "cover_letter": a.cover_letter,
+        "applied_at": a.applied_at,
+        "updated_at": a.updated_at,
+        "attachment_title": None,
+        "company_name": None,
+        "student_name": None,
+        "student_email": None,
+        "student_university": None,
+        "company_notes": a.company_notes,
+    }
+    if include_attachment and a.attachment:
+        d["attachment_title"] = a.attachment.title
+        d["company_name"] = a.attachment.company.name if a.attachment.company else None
+    if a.student:
+        d["student_name"] = a.student.full_name
+        d["student_email"] = a.student.email
+        d["student_university"] = a.student.university
+    return d
+
+
+@app.post("/students/me", response_model=StudentRead)
+def upsert_my_student(
+    payload: StudentCreate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("candidate")),
+):
+    email = _get_current_user_email(current_user)
+    user = _get_user_by_email(db, email)
+
+    student = db.query(Student).filter(Student.email == email).first()
+
+    data = payload.model_dump(exclude_unset=True)
+    data["email"] = data.get("email", email).lower()
+
+    if student:
+        for k, v in data.items():
+            if k == "email":
+                continue
+            setattr(student, k, v)
+    else:
+        student = Student(user_id=user.id, **data)
+        db.add(student)
+
+    db.commit()
+    db.refresh(student)
+
+    skills = extract_skills(student.resume_text)
+    student.skills_text = ", ".join(skills)
+    db.commit()
+
+    return _student_to_dict(student)
+
+
+@app.get("/students/me", response_model=StudentRead)
+def read_my_student(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("candidate")),
+):
+    student = _get_current_student(db, current_user)
+    return _student_to_dict(student)
+
+
+@app.post("/students/upload-resume", response_model=StudentRead)
+async def upload_student_resume(
+    full_name: str = Form(...),
+    university: str | None = Form(None),
+    course: str | None = Form(None),
+    year_of_study: int | None = Form(None),
+    expected_graduation: str | None = Form(None),
+    phone: str | None = Form(None),
+    preferred_location: str | None = Form(None),
+    preferred_duration_weeks: int | None = Form(None),
+    summary: str | None = Form(None),
+    resume: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("candidate")),
+):
+    email = _get_current_user_email(current_user)
+    user = _get_user_by_email(db, email)
+
+    file_bytes = await resume.read()
+    resume_text = extract_resume_text(resume.filename, file_bytes)
+
+    if not resume_text.strip():
+        raise HTTPException(
+            status_code=400, detail="Resume text could not be extracted."
+        )
+
+    grad_date = None
+    if expected_graduation:
+        try:
+            grad_date = date.fromisoformat(expected_graduation)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="expected_graduation must be ISO format (YYYY-MM-DD)",
+            )
+
+    skills = extract_skills(resume_text)
+
+    student = db.query(Student).filter(Student.email == email).first()
+
+    if student:
+        student.full_name = sanitize_resume_text(full_name)
+        student.university = sanitize_resume_text(university) if university else None
+        student.course = sanitize_resume_text(course) if course else None
+        student.year_of_study = year_of_study
+        student.expected_graduation = grad_date
+        student.phone = sanitize_resume_text(phone) if phone else None
+        student.preferred_location = (
+            sanitize_resume_text(preferred_location) if preferred_location else None
+        )
+        student.preferred_duration_weeks = preferred_duration_weeks
+        student.summary = sanitize_resume_text(summary) if summary else None
+        student.resume_text = resume_text
+        student.skills_text = ", ".join(skills)
+        student.original_filename = (
+            sanitize_resume_text(resume.filename) if resume.filename else None
+        )
+    else:
+        student = Student(
+            user_id=user.id,
+            full_name=sanitize_resume_text(full_name),
+            email=email,
+            university=sanitize_resume_text(university) if university else None,
+            course=sanitize_resume_text(course) if course else None,
+            year_of_study=year_of_study,
+            expected_graduation=grad_date,
+            phone=sanitize_resume_text(phone) if phone else None,
+            preferred_location=(
+                sanitize_resume_text(preferred_location) if preferred_location else None
+            ),
+            preferred_duration_weeks=preferred_duration_weeks,
+            summary=sanitize_resume_text(summary) if summary else None,
+            resume_text=resume_text,
+            skills_text=", ".join(skills),
+            original_filename=(
+                sanitize_resume_text(resume.filename) if resume.filename else None
+            ),
+        )
+        db.add(student)
+
+    db.commit()
+    db.refresh(student)
+    return _student_to_dict(student)
+
+
+@app.post("/attachments/{attachment_id}/apply", response_model=ApplicationRead)
+def apply_to_attachment(
+    attachment_id: int,
+    payload: ApplicationCreate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("candidate")),
+):
+    student = _get_current_student(db, current_user)
+
+    att = db.query(Attachment).filter(Attachment.id == attachment_id).first()
+    if not att:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    if att.status != "open":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Attachment is not open for applications (status: {att.status})",
+        )
+
+    existing = (
+        db.query(Application)
+        .filter(
+            Application.student_id == student.id,
+            Application.attachment_id == attachment_id,
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="You have already applied to this attachment",
+        )
+
+    app_obj = Application(
+        student_id=student.id,
+        attachment_id=attachment_id,
+        cover_letter=payload.cover_letter,
+        status="pending",
+    )
+    db.add(app_obj)
+    db.commit()
+    db.refresh(app_obj)
+
+    return _application_to_dict(app_obj)
+
+
+@app.get("/students/me/applications", response_model=List[ApplicationRead])
+def list_my_applications(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("candidate")),
+):
+    student = _get_current_student(db, current_user)
+    rows = (
+        db.query(Application)
+        .filter(Application.student_id == student.id)
+        .order_by(Application.applied_at.desc())
+        .all()
+    )
+    return [_application_to_dict(a) for a in rows]
+
+
+@app.delete("/applications/{application_id}")
+def withdraw_application(
+    application_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("candidate")),
+):
+    student = _get_current_student(db, current_user)
+    app_obj = (
+        db.query(Application)
+        .filter(
+            Application.id == application_id,
+            Application.student_id == student.id,
+        )
+        .first()
+    )
+    if not app_obj:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    if app_obj.status == "accepted":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot withdraw an accepted application. Contact the company.",
+        )
+
+    db.delete(app_obj)
+    db.commit()
+    return {"message": "Application withdrawn", "id": application_id}
+
+
+# ===========================================================================
+# STEP 4 — Company views applicants & updates their status
+# ===========================================================================
+
+
+@app.get(
+    "/my-attachments/{attachment_id}/applicants",
+    response_model=List[ApplicantRead],
+)
+def list_applicants(
+    attachment_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("employer")),
+):
+    company = _get_current_company(db, current_user)
+
+    att = (
+        db.query(Attachment)
+        .filter(
+            Attachment.id == attachment_id,
+            Attachment.company_id == company.id,
+        )
+        .first()
+    )
+    if not att:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    rows = (
+        db.query(Application)
+        .filter(Application.attachment_id == attachment_id)
+        .order_by(Application.applied_at.desc())
+        .all()
+    )
+
+    out: List[dict] = []
+    for app_obj in rows:
+        student = app_obj.student
+        if not student:
+            continue
+        out.append(
+            {
+                "application_id": app_obj.id,
+                "status": app_obj.status,
+                "applied_at": app_obj.applied_at,
+                "student_id": student.id,
+                "full_name": student.full_name,
+                "email": student.email,
+                "phone": student.phone,
+                "university": student.university,
+                "course": student.course,
+                "year_of_study": student.year_of_study,
+                "summary": student.summary,
+                "skills": _text_to_skills(student.skills_text),
+                "cover_letter": app_obj.cover_letter,
+                "company_notes": app_obj.company_notes,
+            }
+        )
+    return out
+
+
+@app.patch("/applications/{application_id}/status", response_model=ApplicationRead)
+def update_application_status(
+    application_id: int,
+    payload: ApplicationStatusUpdate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("employer")),
+):
+    company = _get_current_company(db, current_user)
+
+    app_obj = (
+        db.query(Application)
+        .join(Attachment, Attachment.id == Application.attachment_id)
+        .filter(
+            Application.id == application_id,
+            Attachment.company_id == company.id,
+        )
+        .first()
+    )
+    if not app_obj:
+        raise HTTPException(
+            status_code=404,
+            detail="Application not found or does not belong to your company",
+        )
+
+    app_obj.status = payload.status
+    if payload.company_notes is not None:
+        app_obj.company_notes = payload.company_notes
+
+    db.commit()
+    db.refresh(app_obj)
+    return _application_to_dict(app_obj)
+
+
+# ===========================================================================
+# STEP 9 — Bulk CSV import for students
+# ===========================================================================
+
+
+@app.post("/admin/upload-students-csv")
+async def admin_upload_students_csv(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("admin")),
+):
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Please upload a .csv file")
+
+    raw = await file.read()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1", errors="ignore")
+
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise HTTPException(status_code=400, detail="CSV has no header row")
+
+    def pick(row: dict, *names: str) -> str:
+        normalized = {
+            (k or "").strip().lower(): (v or "").strip() for k, v in row.items()
+        }
+        for n in names:
+            if n in normalized and normalized[n]:
+                return normalized[n]
+        return ""
+
+    saved = 0
+    skipped = 0
+    errors: List[Dict] = []
+
+    for idx, row in enumerate(reader, start=2):
+        full_name = pick(row, "full_name", "name")
+        email = pick(row, "email", "email_address")
+        resume_text = pick(row, "resume_text", "resume", "cv", "bio", "description")
+
+        if not full_name or not email or not resume_text:
+            skipped += 1
+            errors.append(
+                {
+                    "row": idx,
+                    "reason": "Missing required field (full_name, email, or resume_text)",
+                }
+            )
+            continue
+
+        email_l = email.strip().lower()
+        student = db.query(Student).filter(Student.email == email_l).first()
+
+        data = {
+            "full_name": sanitize_resume_text(full_name),
+            "email": email_l,
+            "phone": pick(row, "phone", "phone_number") or None,
+            "university": pick(row, "university", "school") or None,
+            "course": pick(row, "course", "program", "degree") or None,
+            "year_of_study": None,
+            "summary": pick(row, "summary", "headline", "title") or None,
+            "resume_text": sanitize_resume_text(resume_text),
+            "original_filename": file.filename,
+        }
+
+        yos = pick(row, "year_of_study", "year")
+        if yos:
+            try:
+                data["year_of_study"] = int(yos)
+            except ValueError:
+                pass
+
+        pdl = pick(row, "preferred_duration_weeks", "duration_weeks")
+        if pdl:
+            try:
+                data["preferred_duration_weeks"] = int(pdl)
+            except ValueError:
+                pass
+
+        data["preferred_location"] = pick(row, "preferred_location", "location") or None
+        data["skills_text"] = None  # will compute below
+
+        try:
+            if student:
+                for k, v in data.items():
+                    if k == "email":
+                        continue
+                    setattr(student, k, v)
+                target = student
+            else:
+                target = Student(**data)
+                db.add(target)
+
+            db.flush()
+
+            # Compute skills from resume text
+            skills = extract_skills(target.resume_text)
+            target.skills_text = ", ".join(skills)
+
+            db.commit()
+            saved += 1
+        except Exception as e:
+            db.rollback()
+            errors.append({"row": idx, "reason": str(e)})
+
+    return {
+        "message": "Student CSV import complete",
+        "filename": file.filename,
+        "saved": saved,
+        "skipped": skipped,
+        "errors_count": len(errors),
+        "errors": errors[:20],
+    }
+
+
+@app.get("/admin/students")
+def admin_list_students(
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("admin")),
+):
+    rows = db.query(Student).order_by(Student.created_at.desc()).limit(limit).all()
+    return {
+        "count": len(rows),
+        "students": [_student_to_dict(s) for s in rows],
+    }

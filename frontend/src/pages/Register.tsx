@@ -16,7 +16,7 @@ export default function Register() {
     try {
       const data = await register(form);
       toast.success(`Welcome, ${data.full_name}`);
-      navigate(data.role === "employer" ? "/employer" : "/candidate");
+      navigate(data.role === "employer" ? "/company" : "/student");
     } catch (err: any) {
       toast.error(err?.response?.data?.detail ?? "Registration failed");
     } finally {
@@ -54,8 +54,8 @@ export default function Register() {
             <select value={form.role}
               onChange={(e) => setForm({ ...form, role: e.target.value })}
               className="input-dark">
-              <option value="candidate">Candidate — find jobs</option>
-              <option value="employer">Employer — find candidates</option>
+              <option value="candidate">Student — find attachments</option>
+              <option value="employer">Company — post attachments</option>
             </select>
 
             <button type="submit" disabled={loading} className="btn-primary w-full">

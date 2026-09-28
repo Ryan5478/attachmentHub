@@ -21,15 +21,20 @@ def chat(
     model: str = "llama-3.1-8b-instant",
     temperature: float = 0.3,
     max_tokens: int = 1024,
+    response_format: dict | None = None,
 ) -> str:
     client = get_client()
-    completion = client.chat.completions.create(
-        model=model,
-        messages=[
+    request = {
+        "model": model,
+        "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if response_format is not None:
+        request["response_format"] = response_format
+
+    completion = client.chat.completions.create(**request)
     return completion.choices[0].message.content or ""
