@@ -101,3 +101,54 @@ def extract_company_from_url(url: str) -> str:
     # Use the second-to-last part, capitalized: 'jobs.stripe.com' -> 'Stripe'
     name = parts[-2] if len(parts) >= 3 else parts[0]
     return name.capitalize()
+
+
+# ---------------------------------------------------------------------------
+# Attachment/internship-specific aggregators
+# ---------------------------------------------------------------------------
+
+ATTACHMENT_AGGREGATORS = {
+    # East Africa
+    "brightermonday.co.ke",
+    "brightermonday.com",
+    "brightermonday.ug",
+    "fuzu.com",
+    "fuzu.co.ke",
+    "myjobmag.co.ke",
+    "myjobmag.com",
+    "myjobmag.co.ug",
+    "jobwebkenya.com",
+    "careerpointkenya.co.ke",
+    "kenyajob.com",
+    "jobsfund.com",
+    "jobseastafrica.com",
+    "kenyamoja.com",
+    # Global internship boards
+    "internshala.com",
+    "letsintern.com",
+    "hellointern.com",
+    "chegg.com",
+    "chegginternships.com",
+    "wayup.com",
+    "youtern.com",
+    "looksharp.com",
+    "aftercollege.com",
+    "internmatch.com",
+    "internships.com",
+    # University career portals (aggregated, no direct info)
+    "handshake.com",
+    "joinhandshake.com",
+    "symplicity.com",
+    "12twenty.com",
+    "gradleaders.com",
+    # Country-specific boards
+    "seek.com.au",
+    "naukri.com",
+    "reed.co.uk",
+    "totaljobs.com",
+    "stepstone.de",
+    "jobs.ch",
+}
+
+# Union with the existing set
+JOB_BOARD_DOMAINS = JOB_BOARD_DOMAINS | ATTACHMENT_AGGREGATORS

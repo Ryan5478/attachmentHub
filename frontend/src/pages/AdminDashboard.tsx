@@ -75,7 +75,7 @@ function CsvImportCard({ onImported }: { onImported: () => void }) {
         <div>
           <h2 className="font-semibold text-white">Bulk import students</h2>
           <p className="text-xs text-slate-500">
-            CSV with <code className="text-slate-400">full_name</code>,{" "}<code className="text-slate-400">email</code>,{" "}
+            CSV with <code className="text-slate-400">full_name</code>,{" "}<code className="text-slate-400">email</code>,{" "}<code className="text-slate-400">email</code>,{" "}
             <code className="text-slate-400">email</code>,{" "}
             <code className="text-slate-400">resume_text</code>
           </p>

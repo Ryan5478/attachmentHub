@@ -6,6 +6,7 @@ import {
   FileText, DollarSign, Briefcase,
 } from "lucide-react";
 import api from "../api/client";
+import AttachmentDiscovery from "../components/AttachmentDiscovery";
 
 type Attachment = {
   id: number;
@@ -636,6 +637,9 @@ export default function StudentDashboard() {
           }}
         />
       )}
+
+      {/* Live web search */}
+      <AttachmentDiscovery resumeText={profile.resume_text ?? ""} />
     </div>
   );
 }

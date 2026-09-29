@@ -104,3 +104,30 @@ class ApplicantRead(BaseModel):
     skills: List[str] = Field(default_factory=list)
     cover_letter: Optional[str] = None
     company_notes: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Web discovery
+# ---------------------------------------------------------------------------
+class AttachmentDiscoveryRequest(BaseModel):
+    query: str = Field(..., min_length=2, max_length=200)
+    location: Optional[str] = Field(default=None, max_length=100)
+    max_results: int = Field(default=20, ge=1, le=30)
+
+
+class DiscoveredAttachment(BaseModel):
+    title: str
+    url: str
+    company: str = ""
+    snippet: str = ""
+    source: str = ""
+
+
+class AttachmentDiscoveryResponse(BaseModel):
+    query: str
+    location: Optional[str] = None
+    results: List[DiscoveredAttachment]
+    total_searched: int
+    filtered_out: int
+    cached: bool = False
+    cache_age_seconds: int = 0

@@ -1,7 +1,15 @@
 ﻿from __future__ import annotations
 
+from backend.schemas_attachment import (
+    AttachmentDiscoveryRequest,
+    AttachmentDiscoveryResponse,
+    DiscoveredAttachment,
+)
+
+
 from datetime import date
 from backend.engine.job_discovery import discover_jobs
+from backend.engine.attachment_discovery import discover_attachments, clear_cache
 import json
 from backend.engine.groq_client import chat
 from backend.schemas_ai import (
@@ -1672,3 +1680,41 @@ def admin_list_students(
         "count": len(rows),
         "students": [_student_to_dict(s) for s in rows],
     }
+
+
+# ===========================================================================
+# Live web discovery of attachments
+# ===========================================================================
+
+
+@app.post("/attachments/discover", response_model=AttachmentDiscoveryResponse)
+def discover_attachments_endpoint(
+    payload: AttachmentDiscoveryRequest,
+    current_user: dict = Depends(require_roles("candidate", "employer", "admin")),
+):
+    try:
+        data = discover_attachments(
+            query=payload.query,
+            location=payload.location,
+            max_results=payload.max_results,
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    return AttachmentDiscoveryResponse(
+        query=data["query"],
+        location=data.get("location"),
+        results=[DiscoveredAttachment(**r) for r in data["results"]],
+        total_searched=data["total_searched"],
+        filtered_out=data["filtered_out"],
+        cached=data.get("cached", False),
+        cache_age_seconds=data.get("cache_age_seconds", 0),
+    )
+
+
+@app.post("/admin/clear-discovery-cache")
+def admin_clear_discovery_cache(
+    current_user: dict = Depends(require_roles("admin")),
+):
+    n = clear_cache()
+    return {"message": f"Cleared {n} cache entries", "removed": n}
